@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.11', '3.13']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Build all adapters
+        run: python build.py
+
+      - name: Guard tests (every adapter must cover every invariant)
+        run: python -m unittest discover -s tests -v
+
+      - name: Smoke-test the audit script on a precise prompt
+        run: python core/scripts/prompt_audit.py audit --file tests/fixtures/precise.txt
+
+      - name: Smoke-test the audit script on a vague prompt
+        run: python core/scripts/prompt_audit.py audit --file tests/fixtures/vague.txt
+
+  invariants:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - run: python build.py
+      - name: Assert all 13 invariants survive into every target
+        run: |
+          python - <<'PY'
+          import re, pathlib
+          core = pathlib.Path('core/SKILL.md').read_text(encoding='utf-8')
+          ids = set(re.findall(r'\bI(\d{1,2})\b', core))
+          targets = [
+              'dist/workbuddy/prompt-forge/SKILL.md',
+              'dist/claude-code/.claude/skills/prompt-forge/SKILL.md',
+              'dist/codex/AGENTS.md',
+              'dist/deepseek/SYSTEM_PROMPT.md',
+          ]
+          for p in targets:
+              got = set(re.findall(r'\bI(\d{1,2})\b', pathlib.Path(p).read_text(encoding='utf-8')))
+              missing = ids - got
+              assert not missing, f'{p} missing {sorted(missing)}'
+          print(f'OK: {len(ids)} invariants present in all {len(targets)} targets')
+          PY
