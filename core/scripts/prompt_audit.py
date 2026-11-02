@@ -20,6 +20,7 @@ import json
 import os
 import re
 import sys
+from collections import Counter
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8")
@@ -93,6 +94,14 @@ TASK_TYPES = [
     ("meta", r"提示词|prompt|技能|skill|工作流|自动化|规则|流程"),
 ]
 
+# ---------------------------------------------------------------- 计分阈值
+AMBIG_PENALTY_PER_HIT = 3   # 每处歧义信号扣的分
+AMBIG_PENALTY_CAP = 24      # 歧义扣分上限
+SKIP_SCORE = 78             # 达到此分且无缺失槽位时不必改写
+CONFIRM_SCORE = 55          # 有风险信号且低于此分时先确认
+T1_MAX_MISSING = 3          # 缺失槽位不超过此数时只需微改写（T1）
+ONE_LINER_CHARS = 30        # 短于此长度视为一行需求
+
 VAGUE_QUANT = re.compile(r"一些|一点|稍微|适当|尽量|大概|大约|差不多|左右|若干|等等|之类|什么的")
 
 # 回复形态的绝对约束：命中即禁止任何扩写（追加内容本身就在违反它）
@@ -125,16 +134,49 @@ def _pad(s, width):
     return s + " " * max(0, width - _w(s))
 
 
-def audit(text):
-    text = text.strip()
-    n_chars = len(text)
-    cjk = len(re.findall(r"[\u4e00-\u9fff]", text))
+def ambiguity_penalty(hits):
+    """歧义扣分：每处固定扣分，总额封顶。"""
+    return min(hits * AMBIG_PENALTY_PER_HIT, AMBIG_PENALTY_CAP)
 
+
+def detect_task_type(text):
+    """取命中次数最多的任务类型；并列时取 TASK_TYPES 中靠前者，全不命中为 general。"""
     ttype, best = "general", 0
     for name, pattern in TASK_TYPES:
         c = len(_hits(text, pattern))
         if c > best:
             ttype, best = name, c
+    return ttype
+
+
+def decide_verdict(score, missing, present_keys, risk, form_contract, terminate):
+    """裁决：脚本只给建议，最终由 P1.5 的"猜测面"三问决定。返回 (verdict, reason)。"""
+    if form_contract and {"goal", "deliverable", "format"} <= present_keys:
+        return "skip", "输出形态已被「只输出/只能有」唯一确定，任何扩写都会自相矛盾"
+    if terminate:
+        return "skip", "用户给了明确的终止/异常出口，改写会稀释它"
+    if score >= SKIP_SCORE and not missing:
+        return "skip", "适用槽位齐全，执行者没有猜测空间"
+    if risk and score < CONFIRM_SCORE:
+        return "confirm", "高风险且欠定义，先确认再动手"
+    return "rewrite", "存在适用槽位缺失：%s" % "、".join(m["label"] for m in missing)
+
+
+def tier_for(verdict, missing):
+    """把裁决映射到 T0–T3 档位。"""
+    if verdict == "confirm":
+        return "T3"
+    if verdict == "skip":
+        return "T0"
+    return "T1" if len(missing) <= T1_MAX_MISSING else "T2"
+
+
+def audit(text):
+    text = text.strip()
+    n_chars = len(text)
+    cjk = len(re.findall(r"[\u4e00-\u9fff]", text))
+
+    ttype = detect_task_type(text)
 
     # 槽位适用性：自包含脚本任务没有"受众"，也没有"输入材料"可指
     external = bool(re.search(r"[A-Za-z]:[\\/]|https?://|附件|上传|\.(?:csv|xlsx|log|json|txt|pdf|md)\b", text))
@@ -179,7 +221,7 @@ def audit(text):
             risk.append({"label": label, "samples": sorted(set(found))[:5]})
 
     raw_score = 100.0 * got / avail if avail else 0.0
-    penalty = min(ambig_total * 3, 24)
+    penalty = ambiguity_penalty(ambig_total)
     score = max(0, min(100, int(round(raw_score)) - penalty))
 
     missing = [s for s in slots if s["applies"] and not s["present"]]
@@ -189,26 +231,8 @@ def audit(text):
     terminate = bool(_hits(text, TERMINATION))
     subjective = bool(_hits(text, SUBJECTIVE))
 
-    # ---- 裁决：脚本只给建议，最终由 P1.5 的"猜测面"三问决定
-    if form_contract and {"goal", "deliverable", "format"} <= present_keys:
-        verdict, reason = "skip", "输出形态已被「只输出/只能有」唯一确定，任何扩写都会自相矛盾"
-    elif terminate:
-        verdict, reason = "skip", "用户给了明确的终止/异常出口，改写会稀释它"
-    elif score >= 78 and not missing:
-        verdict, reason = "skip", "适用槽位齐全，执行者没有猜测空间"
-    elif risk and score < 55:
-        verdict, reason = "confirm", "高风险且欠定义，先确认再动手"
-    else:
-        verdict, reason = "rewrite", "存在适用槽位缺失：%s" % "、".join(m["label"] for m in missing)
-
-    if verdict == "confirm":
-        tier = "T3"
-    elif verdict == "skip":
-        tier = "T0"
-    elif len(missing) <= 3:
-        tier = "T1"
-    else:
-        tier = "T2"
+    verdict, reason = decide_verdict(score, missing, present_keys, risk, form_contract, terminate)
+    tier = tier_for(verdict, missing)
 
     return {
         "chars": n_chars,
@@ -227,7 +251,7 @@ def audit(text):
         "ambiguity": ambig,
         "ambiguity_hits": ambig_total,
         "risk": risk,
-        "one_liner": "一行说清目标" if n_chars < 30 else "",
+        "one_liner": "一行说清目标" if n_chars < ONE_LINER_CHARS else "",
     }
 
 
@@ -260,7 +284,7 @@ def render_human(r):
             L.append("  · %s：%s" % (m["label"], m["fix"]))
     if r["ambiguity"]:
         L.append("")
-        L.append("[歧义信号] 共 %d 处，扣 %d 分" % (r["ambiguity_hits"], min(r["ambiguity_hits"] * 3, 24)))
+        L.append("[歧义信号] 共 %d 处，扣 %d 分" % (r["ambiguity_hits"], ambiguity_penalty(r["ambiguity_hits"])))
         for a in r["ambiguity"]:
             L.append("  · %s ×%d：%s" % (a["label"], a["count"], ", ".join(a["samples"])))
     if r["risk"]:
@@ -330,7 +354,6 @@ def cmd_ledger(args):
         return 0
 
     # stats
-    from collections import Counter
     c = Counter()
     tot = Counter()
     for r in rows:
@@ -356,15 +379,15 @@ def main():
     a.add_argument("--json", action="store_true", help="输出 JSON")
     a.set_defaults(func=cmd_audit)
 
-    l = sub.add_parser("ledger", help="改写台账")
-    l.add_argument("action", choices=["add", "list", "stats"])
-    l.add_argument("--tier")
-    l.add_argument("--score", type=int)
-    l.add_argument("--patterns", help="逗号分隔的改写模式 key，如 spec,contract,decompose")
-    l.add_argument("--outcome", default="unknown", choices=["ok", "partial", "fail", "unknown"])
-    l.add_argument("--note")
-    l.add_argument("--last", type=int, default=10)
-    l.set_defaults(func=cmd_ledger)
+    ledger = sub.add_parser("ledger", help="改写台账")
+    ledger.add_argument("action", choices=["add", "list", "stats"])
+    ledger.add_argument("--tier")
+    ledger.add_argument("--score", type=int)
+    ledger.add_argument("--patterns", help="逗号分隔的改写模式 key，如 spec,contract,decompose")
+    ledger.add_argument("--outcome", default="unknown", choices=["ok", "partial", "fail", "unknown"])
+    ledger.add_argument("--note")
+    ledger.add_argument("--last", type=int, default=10)
+    ledger.set_defaults(func=cmd_ledger)
 
     args = ap.parse_args()
     sys.exit(args.func(args))
